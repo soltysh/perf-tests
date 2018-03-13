@@ -22,14 +22,15 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"time"
 
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/labels"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/api/v1"
 	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
 	"k8s.io/kubernetes/test/e2e/framework"
-	testutils "k8s.io/kubernetes/test/utils"
 	clusterloaderframework "k8s.io/perf-tests/clusterloader/framework"
 )
 
@@ -52,6 +53,7 @@ var _ = framework.KubeDescribe("Cluster Loader [Feature:ManualPerformance]", fun
 		var namespaces []*v1.Namespace
 		//totalPods := 0 // Keep track of how many pods for stepping
 		// TODO sjug: add concurrency
+		desiredJobs := 0
 		for _, p := range project {
 			// Find tuning if we have it
 			tuning := clusterloaderframework.TuningSets(tuningSets).Get(p.Tuning)
@@ -69,6 +71,7 @@ var _ = framework.KubeDescribe("Cluster Loader [Feature:ManualPerformance]", fun
 
 				// Create templates as defined
 				for _, template := range p.Templates {
+					desiredJobs += template.Number
 					if err = createTemplate(template.Basename, ns, clusterloaderframework.MakePath(template.File), template.Number, tuning); err != nil {
 						framework.Failf("Error creating template, %v", err)
 					}
@@ -108,16 +111,14 @@ var _ = framework.KubeDescribe("Cluster Loader [Feature:ManualPerformance]", fun
 			}
 		}
 
-		// Wait for pods to be running in all new namespaces
+		// Wait for jobs to appear in all new namespaces
 		for _, ns := range namespaces {
-			// TODO If created namespace doesn't have a pod with matching label we will hang
-			label := labels.SelectorFromSet(labels.Set(map[string]string{"purpose": "test"}))
-			err := testutils.WaitForPodsWithLabelRunning(c, ns.Name, label)
+			err := waitForJobs(c, ns.Name, desiredJobs, 2)
 			if err != nil {
-				framework.Failf("Got %v when trying to wait for the pods to start", err)
+				framework.Failf("Got %v when trying to wait for the jobs", err)
 			}
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
-			framework.Logf("All pods running in namespace %s.", ns.Name)
+			framework.Logf("All %d jobs created in namespace %s.", desiredJobs, ns.Name)
 		}
 	})
 })
@@ -184,4 +185,27 @@ func getNsCmdFlag(ns *v1.Namespace) string {
 
 func appendIntToString(s string, i int) string {
 	return s + strconv.Itoa(i)
+}
+
+func waitForJobs(c clientset.Interface, ns string, desired, iterations int) error {
+	result := make([]bool, desired)
+	return wait.Poll(2*time.Second, 10*time.Minute, func() (bool, error) {
+		for i := 0; i < desired; i++ {
+			selector := fmt.Sprintf("job=echo-%d", i)
+			curr, err := c.Batch().Jobs(ns).List(metav1.ListOptions{LabelSelector: selector})
+			if err != nil {
+				return false, err
+			}
+			framework.Logf("Got %d/%d jobs for %s", len(curr.Items), iterations, selector)
+			if len(curr.Items) >= iterations {
+				result[i] = true
+			}
+		}
+		for _, b := range result {
+			if !b {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
 }
